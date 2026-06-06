@@ -1,11 +1,5 @@
 """
 SmartEdu  —  Flask + SocketIO backend
-Combines:
-  • Real-time canvas / drawing / slide sync  (gevent SocketIO)
-  • Full REST API for auth, courses, tests, polls, notes, admin
-  • MongoDB (Atlas) persistence
-  • Cloudinary file uploads
-  • Resend transactional email (OTP + test results)
 """
 
 import os
@@ -42,7 +36,7 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
-    supports_credentials=False,          # must be False when origins="*"
+    supports_credentials=False,
     allow_headers=["Content-Type", "Authorization"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     expose_headers=["Content-Type", "Authorization"],
@@ -106,7 +100,7 @@ test_attempts_col  = db["test_attempts"]
 poll_sessions_col  = db["poll_sessions"]
 announcements_col  = db["announcements"]
 activity_log_col   = db["activity_log"]
-otp_store_col = db["otp_store"]
+otp_store_col      = db["otp_store"]
 
 ADMIN_ID = os.environ.get("ADMIN_ID", "83a39908-cb47-4589-8c58-46f388f3976d")
 
@@ -123,7 +117,7 @@ voice_call_state:      dict[str, dict]  = {}
 sid_map:               dict[str, dict]  = {}
 last_canvas_broadcast: dict[str, float] = {}
 
-CANVAS_BROADCAST_MIN_INTERVAL = 0.08   # 80 ms ≈ 12 fps
+CANVAS_BROADCAST_MIN_INTERVAL = 0.08
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,54 +168,69 @@ def student_socket_for(room, user_id):
 # HELPERS — auth decorators
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _get_user_from_bearer():
+    """Extract and validate Bearer token, return user doc or None."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.split(" ", 1)[1].strip()
+    return users_col.find_one({"id": token})
+
+def _populate_session(user: dict):
+    """Write user fields into Flask session so route handlers work unchanged."""
+    session["user_id"]   = user["id"]
+    session["role"]      = user.get("role", "Student")
+    session["user_name"] = user.get("fullname", "")
+
+
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # 1. Try Flask session (same-origin / web)
+        # 1. Flask session (same-origin / web)
         if "user_id" in session:
             return f(*args, **kwargs)
-
-        # 2. Try Authorization: Bearer <token> (mobile / cross-origin)
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header.split(" ", 1)[1].strip()
-            user = users_col.find_one({"id": token})
-            if user:
-                # Populate session-like keys so route handlers work unchanged
-                session["user_id"] = user["id"]
-                session["role"]    = user.get("role", "Student")
-                session["user_name"] = user.get("fullname", "")
-                return f(*args, **kwargs)
-
+        # 2. Authorization: Bearer <user_id> (mobile / cross-origin)
+        user = _get_user_from_bearer()
+        if user:
+            _populate_session(user)
+            return f(*args, **kwargs)
         return jsonify({"error": "Unauthorized"}), 401
     return decorated
+
 
 def role_required(required_role):
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
-            # 1. Try Flask session
+            # 1. Flask session
             if "user_id" in session:
                 if session.get("role") != required_role:
                     return jsonify({"error": "Forbidden"}), 403
                 return f(*args, **kwargs)
-
-            # 2. Try Authorization: Bearer <token>
-            auth_header = request.headers.get("Authorization", "")
-            if auth_header.startswith("Bearer "):
-                token = auth_header.split(" ", 1)[1].strip()
-                user = users_col.find_one({"id": token})
-                if user:
-                    if user.get("role") != required_role:
-                        return jsonify({"error": "Forbidden"}), 403
-                    session["user_id"]   = user["id"]
-                    session["role"]      = user.get("role", "Student")
-                    session["user_name"] = user.get("fullname", "")
-                    return f(*args, **kwargs)
-
-        return jsonify({"error": "Unauthorized"}), 401
+            # 2. Authorization: Bearer <user_id>
+            user = _get_user_from_bearer()
+            if user:
+                if user.get("role") != required_role:
+                    return jsonify({"error": "Forbidden"}), 403
+                _populate_session(user)
+                return f(*args, **kwargs)
+            return jsonify({"error": "Unauthorized"}), 401
         return decorated
     return decorator
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS — preflight
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        res = app.make_default_options_response()
+        res.headers["Access-Control-Allow-Origin"]  = "*"
+        res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        return res
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,7 +260,6 @@ def log_admin_action(action: str, admin_id: str = None):
         pass
 
 def serialize(doc: dict) -> dict:
-    """Remove MongoDB _id and convert datetime to ISO string."""
     out = {k: v for k, v in doc.items() if k != "_id"}
     for k, v in out.items():
         if hasattr(v, "isoformat"):
@@ -346,8 +354,6 @@ def send_test_result_email(to: str, name: str, test_name: str, score: float, cor
 #  SOCKET.IO  —  REAL-TIME EVENTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-# ── Join / Disconnect ─────────────────────────────────────────────────────────
-
 @socketio.on("join-room")
 def on_join_room(data):
     room    = data["class_id"]
@@ -397,8 +403,6 @@ def on_disconnect():
             socketio.emit("voice-ended-by-student", {"student_id": user_id}, to=teacher_sid)
 
 
-# ── WebRTC signaling ──────────────────────────────────────────────────────────
-
 @socketio.on("offer")
 def on_offer(data):
     emit("offer", {"offer": data["offer"], "from": request.sid}, to=data["to"])
@@ -411,8 +415,6 @@ def on_answer(data):
 def on_ice(data):
     emit("ice-candidate", {"candidate": data["candidate"], "from": request.sid}, to=data["to"])
 
-
-# ── Drawing ───────────────────────────────────────────────────────────────────
 
 @socketio.on("draw-start")
 def on_draw_start(data):
@@ -430,8 +432,6 @@ def on_erase(data):
 def on_draw_end(data):
     emit("draw-end", {}, room=data["class_id"], include_self=False)
 
-
-# ── Canvas image sync ─────────────────────────────────────────────────────────
 
 @socketio.on("canvas-image")
 def on_canvas_image(data):
@@ -462,8 +462,6 @@ def on_clear_canvas(data):
     set_slide_image(room, slide, None)
     emit("clear-canvas", {}, room=room, include_self=False)
 
-
-# ── Slides ────────────────────────────────────────────────────────────────────
 
 def _emit_slide_changed(room, slide):
     image = get_slide_image(room, slide)
@@ -526,8 +524,6 @@ def on_get_slides(data):
     emit("slides-list", {"slides": ordered, "current": current_slide.get(room, 0)})
 
 
-# ── Upload progress ───────────────────────────────────────────────────────────
-
 @socketio.on("upload-start")
 def on_upload_start(data):
     emit("upload-start", {"label": data.get("label", "Loading…")},
@@ -539,14 +535,10 @@ def on_upload_progress(data):
          room=data["class_id"], include_self=False)
 
 
-# ── Class ended ───────────────────────────────────────────────────────────────
-
 @socketio.on("class-ended")
 def on_class_ended(data):
     emit("class-ended", {}, room=data["class_id"], include_self=False)
 
-
-# ── Polls ─────────────────────────────────────────────────────────────────────
 
 @socketio.on("poll-start")
 def on_poll_start(data):
@@ -590,8 +582,6 @@ def on_show_leaderboard(data):
          room=data["class_id"], include_self=False)
 
 
-# ── Hand raise ────────────────────────────────────────────────────────────────
-
 @socketio.on("hand-raise")
 def on_hand_raise(data):
     room = data["class_id"]; ensure_hand(room)
@@ -614,8 +604,6 @@ def on_hand_dismissed(data):
     else:
         emit("hand-dismissed", {"user_id": user_id}, room=room, include_self=False)
 
-
-# ── Voice call ────────────────────────────────────────────────────────────────
 
 @socketio.on("voice-accept")
 def on_voice_accept(data):
@@ -683,16 +671,10 @@ def on_voice_ended_by_student(data):
 #  HTTP  —  REST API
 # ═════════════════════════════════════════════════════════════════════════════
 
-# ── Health ────────────────────────────────────────────────────────────────────
-
 @app.route("/")
 def health():
     return jsonify({"status": "ok", "rooms": len(canvas_data), "connections": len(sid_map)})
 
-
-
-
-# ── Canvas PDF export ─────────────────────────────────────────────────────────
 
 @app.route("/get-slides-pdf/<class_id>")
 def get_slides_pdf(class_id):
@@ -703,7 +685,7 @@ def get_slides_pdf(class_id):
     return jsonify({"slides": valid, "total": len(valid)})
 
 
-# ── Auth — register / verify / login ─────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -717,15 +699,22 @@ def register():
         if users_col.find_one({"email": email}):
             return jsonify({"error": "Email already registered"}), 409
 
-        otp = str(random.randint(100000, 999999))
-        session["pending_user"] = {
-            "fullname": fullname, "email": email,
+        otp   = str(random.randint(100000, 999999))
+        token = str(uuid.uuid4())
+        expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        otp_store_col.insert_one({
+            "token":    token,
+            "fullname": fullname,
+            "email":    email,
             "password": generate_password_hash(password),
-            "role": "Student", "otp": otp,
-            "otp_expiry": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-        }
+            "role":     "Student",
+            "otp":      otp,
+            "expiry":   expiry,
+            "type":     "register",
+        })
         send_otp_email(email, otp)
-        return jsonify({"message": "OTP sent", "requires_otp": True})
+        return jsonify({"message": "OTP sent", "requires_otp": True, "otp_token": token})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -733,42 +722,50 @@ def register():
 @app.route("/verify-otp", methods=["POST"])
 def verify_otp():
     try:
-        data    = request.get_json() or request.form
-        entered = str(data.get("otp", "")).strip()
-        pending = session.get("pending_user")
-        if not pending:
+        data      = request.get_json() or request.form
+        entered   = str(data.get("otp", "")).strip()
+        otp_token = str(data.get("otp_token", "")).strip()
+
+        if not otp_token:
+            return jsonify({"error": "Missing otp_token"}), 400
+
+        record = otp_store_col.find_one({"token": otp_token, "type": "register"})
+        if not record:
             return jsonify({"error": "No pending registration"}), 400
 
-        expiry = datetime.fromisoformat(pending["otp_expiry"])
+        expiry = record["expiry"]
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
         if datetime.now(timezone.utc) > expiry:
-            session.pop("pending_user", None)
+            otp_store_col.delete_one({"token": otp_token})
             return jsonify({"error": "OTP expired"}), 400
-        if entered != pending["otp"]:
+        if entered != record["otp"]:
             return jsonify({"error": "Invalid OTP"}), 400
+
+        otp_store_col.delete_one({"token": otp_token})
 
         user_id = str(uuid.uuid4())
         users_col.insert_one({
-            "id": user_id, "fullname": pending["fullname"],
-            "email": pending["email"], "password": pending["password"],
-            "role": pending["role"], "subscribed": "no",
+            "id": user_id, "fullname": record["fullname"],
+            "email": record["email"], "password": record["password"],
+            "role": record["role"], "subscribed": "no",
             "created_at": datetime.now(timezone.utc),
         })
-        if pending["role"] == "Teacher":
+        if record["role"] == "Teacher":
             teachers_col.insert_one({
                 "teacher_id": str(uuid.uuid4()), "user_id": user_id,
-                "fullname": pending["fullname"], "headline": "", "bio": "",
+                "fullname": record["fullname"], "headline": "", "bio": "",
                 "education": "", "experience": "", "languages": [],
                 "specialization": "", "category": "", "courses": [],
                 "free_classes": [], "rating": 0, "total_students": 0,
                 "created_at": datetime.now(timezone.utc),
             })
 
-        session.update({"user_id": user_id, "role": pending["role"], "user_name": pending["fullname"]})
+        session.update({"user_id": user_id, "role": record["role"], "user_name": record["fullname"]})
         session.permanent = True
-        session.pop("pending_user", None)
 
-        user_out = {"id": user_id, "fullname": pending["fullname"],
-                    "email": pending["email"], "role": pending["role"]}
+        user_out = {"id": user_id, "fullname": record["fullname"],
+                    "email": record["email"], "role": record["role"]}
         return jsonify({"user": user_out, "token": user_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -789,36 +786,31 @@ def login():
             return jsonify({"error": "Incorrect password"}), 401
 
         otp   = str(random.randint(100000, 999999))
-        token = str(uuid.uuid4())          # ← client holds this
+        token = str(uuid.uuid4())
         expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
 
-        otp_store_col.update_one(
-            {"token": token},
-            {"$set": {
-                "token":    token,
-                "user_id":  user["id"],
-                "fullname": user["fullname"],
-                "email":    user["email"],
-                "role":     user["role"],
-                "otp":      otp,
-                "expiry":   expiry,
-                "type":     "login",
-            }},
-            upsert=True
-        )
+        otp_store_col.insert_one({
+            "token":    token,
+            "user_id":  user["id"],
+            "fullname": user["fullname"],
+            "email":    user["email"],
+            "role":     user["role"],
+            "otp":      otp,
+            "expiry":   expiry,
+            "type":     "login",
+        })
         send_login_otp_email(user["email"], otp)
         return jsonify({"requires_otp": True, "message": "OTP sent", "otp_token": token})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# /login-verify-otp — look up by token, not session
 @app.route("/login-verify-otp", methods=["POST"])
 def login_verify_otp():
     try:
         data      = request.get_json() or request.form
         entered   = str(data.get("otp", "")).strip()
-        otp_token = str(data.get("otp_token", "")).strip()   # ← sent by client
+        otp_token = str(data.get("otp_token", "")).strip()
 
         if not otp_token:
             return jsonify({"error": "Missing otp_token"}), 400
@@ -826,16 +818,18 @@ def login_verify_otp():
         record = otp_store_col.find_one({"token": otp_token, "type": "login"})
         if not record:
             return jsonify({"error": "No pending login"}), 400
-        if datetime.now(timezone.utc) > record["expiry"].replace(tzinfo=timezone.utc):
+
+        expiry = record["expiry"]
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > expiry:
             otp_store_col.delete_one({"token": otp_token})
             return jsonify({"error": "OTP expired"}), 400
         if entered != record["otp"]:
             return jsonify({"error": "Invalid OTP"}), 400
 
-        # Clean up
         otp_store_col.delete_one({"token": otp_token})
 
-        # Set server session (best-effort; mobile uses the returned token)
         session.update({
             "user_id":   record["user_id"],
             "role":      record["role"],
@@ -854,17 +848,23 @@ def login_verify_otp():
         return jsonify({"error": str(e)}), 500
 
 
-# ── Student home data ─────────────────────────────────────────────────────────
+@app.route("/logout", methods=["POST", "GET"])
+def logout():
+    session.clear()
+    return jsonify({"message": "Logged out"})
+
+
+# ── Student ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/student/home")
 @login_required
 def student_home():
     user_id = session["user_id"]
     today   = datetime.now().strftime("%Y-%m-%d")
-    enrolled_class_ids = {e["class_id"] for e in user_classes_col.find({"user_id": user_id})}
+    enrolled_class_ids  = {e["class_id"]  for e in user_classes_col.find({"user_id": user_id})}
     enrolled_course_ids = {e["course_id"] for e in user_courses_col.find({"user_id": user_id})}
 
-    all_classes = list(classes_col.find({"class_id": {"$in": list(enrolled_class_ids)}}))
+    all_classes      = list(classes_col.find({"class_id": {"$in": list(enrolled_class_ids)}}))
     today_classes    = [c for c in all_classes if c.get("date") == today]
     upcoming_classes = [c for c in all_classes if c.get("date", "") > today]
 
@@ -886,9 +886,9 @@ def student_home():
         if course:
             teacher = teachers_col.find_one({"teacher_id": course.get("teacher_id")})
             courses.append({
-                "course_id":    cid,
-                "title":        course.get("name"),
-                "teacher_name": teacher.get("fullname") if teacher else "",
+                "course_id":     cid,
+                "title":         course.get("name"),
+                "teacher_name":  teacher.get("fullname") if teacher else "",
                 "total_classes": course.get("total_classes", 0),
             })
 
@@ -899,25 +899,23 @@ def student_home():
     })
 
 
-# ── Student tests ─────────────────────────────────────────────────────────────
-
 @app.route("/api/student/tests")
 @login_required
 def student_tests():
     user_id = session["user_id"]
     enrolled_course_ids = [e["course_id"] for e in user_courses_col.find({"user_id": user_id})]
-    tests   = list(tests_col.find({"course_id": {"$in": enrolled_course_ids}}))
+    tests = list(tests_col.find({"course_id": {"$in": enrolled_course_ids}}))
     out = []
     for t in tests:
-        attempt  = test_attempts_col.find_one({"user_id": user_id, "test_id": t["test_id"]})
+        attempt = test_attempts_col.find_one({"user_id": user_id, "test_id": t["test_id"]})
         st = t.get("start_time")
         out.append({
-            "test_id":        t["test_id"],
-            "name":           t.get("name"),
-            "total_questions": len(t.get("questions", [])),
+            "test_id":          t["test_id"],
+            "name":             t.get("name"),
+            "total_questions":  len(t.get("questions", [])),
             "duration_minutes": t.get("duration"),
-            "start_time":     st.isoformat() if hasattr(st, "isoformat") else str(st) if st else None,
-            "attempted":      bool(attempt),
+            "start_time":       st.isoformat() if hasattr(st, "isoformat") else str(st) if st else None,
+            "attempted":        bool(attempt),
         })
     return jsonify({"tests": out})
 
@@ -929,10 +927,9 @@ def start_test(test_id):
     if not test:
         return jsonify({"error": "Test not found"}), 404
     st = test.get("start_time")
-    qs = []
-    for q in test.get("questions", []):
-        qs.append({"id": q.get("id", ""), "question": q.get("question"),
-                   "options": q.get("options"), "type": "mcq"})
+    qs = [{"id": q.get("id", ""), "question": q.get("question"),
+            "options": q.get("options"), "type": "mcq"}
+           for q in test.get("questions", [])]
     return jsonify({"test": {
         "test_id": test_id, "name": test.get("name"),
         "duration_minutes": test.get("duration"),
@@ -973,7 +970,6 @@ def submit_test_api(test_id):
                   "wrong": wrong, "submitted_at": datetime.utcnow()}},
         upsert=True
     )
-
     user = users_col.find_one({"id": user_id})
     if user and user.get("email"):
         send_test_result_email(
@@ -981,11 +977,8 @@ def submit_test_api(test_id):
             test_name=test.get("name", "Test"), score=score,
             correct=correct, wrong=wrong, total=len(test.get("questions", []))
         )
-
     return jsonify({"score": score, "correct": correct, "wrong": wrong})
 
-
-# ── Student results ───────────────────────────────────────────────────────────
 
 @app.route("/api/student/results")
 @login_required
@@ -997,13 +990,13 @@ def student_results():
         test = tests_col.find_one({"test_id": a["test_id"]})
         sa   = a.get("submitted_at")
         out.append({
-            "test_id":        a["test_id"],
-            "test_name":      test.get("name") if test else "Unknown",
-            "score":          a.get("score", 0),
-            "correct":        a.get("correct", 0),
-            "wrong":          a.get("wrong", 0),
+            "test_id":         a["test_id"],
+            "test_name":       test.get("name") if test else "Unknown",
+            "score":           a.get("score", 0),
+            "correct":         a.get("correct", 0),
+            "wrong":           a.get("wrong", 0),
             "total_questions": len(test.get("questions", [])) if test else 0,
-            "submitted_at":   sa.isoformat() if hasattr(sa, "isoformat") else None,
+            "submitted_at":    sa.isoformat() if hasattr(sa, "isoformat") else None,
         })
     return jsonify({"results": out})
 
@@ -1036,8 +1029,6 @@ def get_attempt(test_id, user_id):
     return jsonify(result)
 
 
-# ── Student notes ─────────────────────────────────────────────────────────────
-
 @app.route("/api/student/notes")
 @login_required
 def student_notes():
@@ -1055,8 +1046,6 @@ def student_notes():
     return jsonify(out)
 
 
-# ── Student announcements ─────────────────────────────────────────────────────
-
 @app.route("/api/student/announcements")
 @login_required
 def student_announcements():
@@ -1068,12 +1057,10 @@ def student_announcements():
     return jsonify({"announcements": docs})
 
 
-# ── Student courses ───────────────────────────────────────────────────────────
-
 @app.route("/api/student/courses")
 @login_required
 def student_courses():
-    user_id = session["user_id"]
+    user_id  = session["user_id"]
     enrolled = [e["course_id"] for e in user_courses_col.find({"user_id": user_id})]
     courses  = []
     for cid in enrolled:
@@ -1111,8 +1098,6 @@ def enroll_class_api():
     return jsonify({"status": "enrolled"})
 
 
-# ── Schedule by date ──────────────────────────────────────────────────────────
-
 @app.route("/get-classes")
 @login_required
 def get_classes():
@@ -1138,11 +1123,8 @@ def get_classes():
             out.append({"type": "test", "test_id": t["test_id"],
                         "subject": t.get("name"), "date": date_str,
                         "time": st.strftime("%H:%M"), "duration": t.get("duration")})
-
     return jsonify(out)
 
-
-# ── Recording ─────────────────────────────────────────────────────────────────
 
 @app.route("/recording/<class_id>")
 @login_required
@@ -1157,7 +1139,7 @@ def recording(class_id):
     return jsonify({"link": cls.get("link"), "subject": cls.get("subject", "Recording")})
 
 
-# ── Public courses + teachers ─────────────────────────────────────────────────
+# ── Public ────────────────────────────────────────────────────────────────────
 
 @app.route("/api/courses")
 def public_courses():
@@ -1183,18 +1165,14 @@ def public_course(course_id):
         course["start_date"] = course["start_date"].isoformat()
     if hasattr(course.get("created_at"), "isoformat"):
         course["created_at"] = course["created_at"].isoformat()
-
     teacher = teachers_col.find_one({"teacher_id": course.get("teacher_id")})
     course["teacher_name"] = teacher.get("fullname") if teacher else ""
-
     clss  = [serialize(c) for c in classes_col.find({"course_id": course_id})]
     tests = [serialize(t) for t in tests_col.find({"course_id": course_id})]
     notes = [serialize(n) for n in notes_col.find({"course_id": course_id})]
-
     enrolled = False
     if "user_id" in session:
         enrolled = bool(user_courses_col.find_one({"user_id": session["user_id"], "course_id": course_id}))
-
     return jsonify({"course": course, "classes": clss, "tests": tests, "notes": notes, "enrolled": enrolled})
 
 
@@ -1214,7 +1192,6 @@ def public_teacher(user_id_or_teacher_id):
                teachers_col.find_one({"teacher_id": user_id_or_teacher_id}))
     if not teacher:
         return jsonify({"error": "Not found"}), 404
-
     user = users_col.find_one({"id": teacher["user_id"]}, {"_id": 0, "password": 0})
     reviews = list(reviews_col.find({"teacher_id": teacher["teacher_id"]}))
     for r in reviews:
@@ -1223,15 +1200,12 @@ def public_teacher(user_id_or_teacher_id):
         r["name"] = rev_user.get("fullname") if rev_user else "Student"
         if hasattr(r.get("created_at"), "isoformat"):
             r["created_at"] = r["created_at"].isoformat()
-
     courses = list(courses_col.find({"teacher_id": teacher["teacher_id"]}, {"_id": 0}))
-
     followers_count = followers_col.count_documents({"teacher_id": teacher["teacher_id"]})
     is_following = False
     if "user_id" in session:
         is_following = bool(followers_col.find_one(
             {"follower_id": session["user_id"], "teacher_id": teacher["teacher_id"]}))
-
     return jsonify({
         "teacher": {**serialize(teacher), **(serialize(user) if user else {})},
         "reviews": reviews,
@@ -1246,7 +1220,7 @@ def public_teacher(user_id_or_teacher_id):
 @app.route("/toggle-follow", methods=["POST"])
 @login_required
 def toggle_follow():
-    user_id   = session["user_id"]
+    user_id    = session["user_id"]
     teacher_id = (request.get_json() or {}).get("teacher_id")
     if not teacher_id:
         return jsonify({"error": "teacher_id required"}), 400
@@ -1273,7 +1247,6 @@ def add_review(teacher_id):
         return jsonify({"error": "Teacher not found"}), 404
     if teacher["user_id"] == user_id:
         return jsonify({"error": "Cannot review yourself"}), 400
-
     existing = reviews_col.find_one({"teacher_id": teacher_id, "user_id": user_id})
     if existing:
         reviews_col.update_one({"_id": existing["_id"]},
@@ -1281,53 +1254,43 @@ def add_review(teacher_id):
     else:
         reviews_col.insert_one({"teacher_id": teacher_id, "user_id": user_id,
                                  "rating": rating, "comment": comment, "created_at": datetime.now()})
-
     reviews = list(reviews_col.find({"teacher_id": teacher_id}))
     avg = sum(r["rating"] for r in reviews) / len(reviews) if reviews else 0
-    teachers_col.update_one({"teacher_id": teacher_id},
-                             {"$set": {"rating": round(avg, 1)}})
+    teachers_col.update_one({"teacher_id": teacher_id}, {"$set": {"rating": round(avg, 1)}})
     return jsonify({"message": "Review submitted"})
 
 
-# ── Teacher — home, courses, classes ─────────────────────────────────────────
+# ── Teacher ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/teacher/home")
 @login_required
 def teacher_home():
-    user_id = session["user_id"]
-    teacher = teachers_col.find_one({"user_id": user_id})
+    user_id    = session["user_id"]
+    teacher    = teachers_col.find_one({"user_id": user_id})
     teacher_id = teacher["teacher_id"] if teacher else user_id
-
     my_classes = list(classes_col.find({"teacher_id": teacher_id}))
     my_courses = list(courses_col.find({"teacher_id": teacher_id}, {"_id": 0}))
-
-    out_classes = []
-    for c in my_classes:
-        out_classes.append({"class_id": c["class_id"], "title": c.get("subject", c.get("title", "")),
-                             "date": c.get("date"), "time": c.get("time"),
-                             "status": get_class_status(c)})
-
-    return jsonify({"my_classes": out_classes,
-                    "my_courses": [serialize(c) for c in my_courses]})
+    out_classes = [{"class_id": c["class_id"], "title": c.get("subject", c.get("title", "")),
+                    "date": c.get("date"), "time": c.get("time"),
+                    "status": get_class_status(c)} for c in my_classes]
+    return jsonify({"my_classes": out_classes, "my_courses": [serialize(c) for c in my_courses]})
 
 
 @app.route("/api/teacher/create-class", methods=["POST"])
 @login_required
 def teacher_create_class():
-    user_id = session["user_id"]
-    teacher = teachers_col.find_one({"user_id": user_id})
+    user_id    = session["user_id"]
+    teacher    = teachers_col.find_one({"user_id": user_id})
     teacher_id = teacher["teacher_id"] if teacher else user_id
-    data = request.get_json() or {}
-
-    title     = (data.get("title") or data.get("subject") or "").strip()
-    date      = data.get("date", "").strip()
-    time_val  = data.get("time", "").strip()
+    data       = request.get_json() or {}
+    title      = (data.get("title") or data.get("subject") or "").strip()
+    date       = data.get("date", "").strip()
+    time_val   = data.get("time", "").strip()
     if not title or not date or not time_val:
         return jsonify({"error": "title, date, time required"}), 400
-
     class_id = str(uuid.uuid4())
     classes_col.insert_one({
-        "class_id":   class_id, "course_id": data.get("course_id"),
+        "class_id": class_id, "course_id": data.get("course_id"),
         "teacher_id": teacher_id, "subject": title,
         "date": date, "time": time_val,
         "description": data.get("description", ""),
@@ -1368,9 +1331,9 @@ def teacher_class_students(class_id):
 @app.route("/api/teacher/create-test", methods=["POST"])
 @login_required
 def teacher_create_test():
-    user_id = session["user_id"]
-    data    = request.get_json() or {}
-    test_id = str(uuid.uuid4())
+    user_id   = session["user_id"]
+    data      = request.get_json() or {}
+    test_id   = str(uuid.uuid4())
     start_raw = data.get("start_time", "")
     start_time = None
     for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
@@ -1380,7 +1343,6 @@ def teacher_create_test():
             pass
     if not start_time:
         return jsonify({"error": "Invalid start_time format. Use YYYY-MM-DDTHH:MM"}), 400
-
     tests_col.insert_one({
         "test_id": test_id, "course_id": data.get("course_id"),
         "teacher_id": user_id, "name": data.get("name"),
@@ -1421,8 +1383,6 @@ def teacher_announcement():
     return jsonify({"message": "Announcement sent"})
 
 
-# ── Teacher profile ───────────────────────────────────────────────────────────
-
 @app.route("/teacher/profile")
 @login_required
 def teacher_profile_api():
@@ -1439,7 +1399,7 @@ def update_teacher_profile():
     user_id = session["user_id"]
     data    = request.get_json() or {}
     users_col.update_one({"id": user_id}, {"$set": {"fullname": data.get("fullname")}})
-    langs = data.get("languages", "")
+    langs     = data.get("languages", "")
     lang_list = [l.strip() for l in langs.split(",")] if langs else []
     teachers_col.update_one({"user_id": user_id}, {"$set": {
         "fullname": data.get("fullname"), "headline": data.get("headline"),
@@ -1453,10 +1413,10 @@ def update_teacher_profile():
 @app.route("/teacher/course/<course_id>")
 @login_required
 def teacher_course_detail(course_id):
-    course  = courses_col.find_one({"course_id": course_id}, {"_id": 0})
-    clss    = [serialize(c) for c in classes_col.find({"course_id": course_id})]
-    tests   = [serialize(t) for t in tests_col.find({"course_id": course_id})]
-    notes   = [serialize(n) for n in notes_col.find({"course_id": course_id})]
+    course = courses_col.find_one({"course_id": course_id}, {"_id": 0})
+    clss   = [serialize(c) for c in classes_col.find({"course_id": course_id})]
+    tests  = [serialize(t) for t in tests_col.find({"course_id": course_id})]
+    notes  = [serialize(n) for n in notes_col.find({"course_id": course_id})]
     return jsonify({"course": serialize(course) if course else {}, "classes": clss, "tests": tests, "notes": notes})
 
 
@@ -1509,7 +1469,7 @@ def upload_note():
         return jsonify({"error": str(e)}), 500
 
 
-# ── Comments (live chat) ──────────────────────────────────────────────────────
+# ── Comments ──────────────────────────────────────────────────────────────────
 
 @app.route("/get-comments/<class_id>")
 @login_required
@@ -1524,9 +1484,9 @@ def get_comments(class_id):
 @app.route("/add-comment", methods=["POST"])
 @login_required
 def add_comment():
-    user_id = session["user_id"]
-    user    = users_col.find_one({"id": user_id})
-    data    = request.get_json() or {}
+    user_id  = session["user_id"]
+    user     = users_col.find_one({"id": user_id})
+    data     = request.get_json() or {}
     class_id = data.get("class_id")
     text     = (data.get("text") or "").strip()
     if not class_id or not text:
@@ -1535,8 +1495,7 @@ def add_comment():
         "class_id": class_id, "user_id": user_id,
         "name": user.get("fullname") if user else "Student",
         "role": user.get("role") if user else "Student",
-        "text": text, "type": "message",
-        "created_at": datetime.now(),
+        "text": text, "type": "message", "created_at": datetime.now(),
     })
     return jsonify({"message": "Sent"})
 
@@ -1607,11 +1566,9 @@ def poll_leaderboard(class_id):
                 leaderboard[uid]["correct"] += 1; leaderboard[uid]["score"] += 10
             else:
                 leaderboard[uid]["wrong"] += 1
-
     for u in users_col.find({"id": {"$in": list(leaderboard.keys())}}, {"id": 1, "fullname": 1}):
         if u["id"] in leaderboard:
             leaderboard[u["id"]]["name"] = u["fullname"]
-
     return jsonify(sorted(leaderboard.values(), key=lambda x: x["score"], reverse=True))
 
 
@@ -1632,10 +1589,9 @@ def subscribe():
 @app.route("/create-order", methods=["POST"])
 @login_required
 def create_order():
-    # Integrate your Razorpay key here
     data  = request.get_json() or {}
     plan  = int(data.get("plan", 1))
-    price = {1: 29900, 3: 74900, 6: 129900}.get(plan, 29900)  # paise
+    price = {1: 29900, 3: 74900, 6: 129900}.get(plan, 29900)
     return jsonify({"payment_url": None, "amount": price, "currency": "INR",
                     "plan": plan, "message": "Integrate Razorpay order creation here"})
 
@@ -1647,7 +1603,7 @@ def search_page():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"courses": [], "teachers": [], "tests": []})
-    regex = {"$regex": q, "$options": "i"}
+    regex    = {"$regex": q, "$options": "i"}
     courses  = list(courses_col.find({"name": regex}, {"_id": 0, "course_id": 1, "name": 1}).limit(10))
     teachers = list(teachers_col.find({"fullname": regex}, {"_id": 0, "teacher_id": 1, "fullname": 1, "user_id": 1}).limit(10))
     for t in teachers:
@@ -1665,16 +1621,16 @@ def admin_analytics():
         cat_data = {d["_id"] or "General": d["count"]
                     for d in courses_col.aggregate([{"$group": {"_id": "$category", "count": {"$sum": 1}}}])}
         return jsonify({
-            "total_users":   users_col.count_documents({}),
-            "total_courses": courses_col.count_documents({}),
-            "total_classes": classes_col.count_documents({}),
-            "pro_users":     users_col.count_documents({"subscribed": "yes"}),
-            "free_users":    users_col.count_documents({"subscribed": {"$ne": "yes"}}),
-            "students":      users_col.count_documents({"role": "Student"}),
-            "teachers":      users_col.count_documents({"role": "Teacher"}),
-            "admins":        users_col.count_documents({"role": "Admin"}),
-            "total_tests":   tests_col.count_documents({}),
-            "total_notes":   notes_col.count_documents({}),
+            "total_users":    users_col.count_documents({}),
+            "total_courses":  courses_col.count_documents({}),
+            "total_classes":  classes_col.count_documents({}),
+            "pro_users":      users_col.count_documents({"subscribed": "yes"}),
+            "free_users":     users_col.count_documents({"subscribed": {"$ne": "yes"}}),
+            "students":       users_col.count_documents({"role": "Student"}),
+            "teachers":       users_col.count_documents({"role": "Teacher"}),
+            "admins":         users_col.count_documents({"role": "Admin"}),
+            "total_tests":    tests_col.count_documents({}),
+            "total_notes":    notes_col.count_documents({}),
             "total_attempts": test_attempts_col.count_documents({}),
             "category_breakdown": cat_data,
         })

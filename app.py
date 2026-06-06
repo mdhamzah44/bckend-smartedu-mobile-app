@@ -652,11 +652,6 @@ def on_voice_ended_by_student(data):
 def health():
     return jsonify({"status": "ok", "rooms": len(canvas_data), "connections": len(sid_map)})
 
-@app.route("/health")
-def health():
-    return {"status": "healthy"}, 200
-
-
 
 
 

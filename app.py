@@ -33,10 +33,15 @@ app.config["SESSION_COOKIE_SECURE"]   = True
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
+# Replace your CORS config with this:
 CORS(
     app,
-    resources={r"/*": {"origins": "*"}},
-    supports_credentials=False,
+    resources={r"/*": {"origins": [
+        "http://localhost:8081",
+        "http://localhost:3000",
+        "https://your-production-frontend.com",  # add your real domain
+    ]}},
+    supports_credentials=True,          # ← was False
     allow_headers=["Content-Type", "Authorization"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     expose_headers=["Content-Type", "Authorization"],
@@ -226,8 +231,16 @@ def role_required(required_role):
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
+        origin = request.headers.get("Origin", "")
+        allowed = [
+            "http://localhost:8081",
+            "http://localhost:3000",
+            "https://your-production-frontend.com",
+        ]
         res = app.make_default_options_response()
-        res.headers["Access-Control-Allow-Origin"]  = "*"
+        if origin in allowed:
+            res.headers["Access-Control-Allow-Origin"] = origin   # ← echo back, not *
+            res.headers["Access-Control-Allow-Credentials"] = "true"
         res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         return res

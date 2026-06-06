@@ -1,3 +1,6 @@
+from gevent import monkey
+monkey.patch_all()
+
 """
 SmartEdu  —  Flask + SocketIO backend
 """
@@ -33,15 +36,10 @@ app.config["SESSION_COOKIE_SECURE"]   = True
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
-# Replace your CORS config with this:
 CORS(
     app,
-    resources={r"/*": {"origins": [
-        "http://localhost:8081",
-        "http://localhost:3000",
-        "https://your-production-frontend.com",  # add your real domain
-    ]}},
-    supports_credentials=True,          # ← was False
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=True,
     allow_headers=["Content-Type", "Authorization"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     expose_headers=["Content-Type", "Authorization"],
@@ -54,7 +52,6 @@ socketio = SocketIO(
     ping_timeout=60,
     ping_interval=20,
     max_http_buffer_size=80 * 1024 * 1024,
-    compression_threshold=1024,
     logger=False,
     engineio_logger=False,
 )
@@ -174,7 +171,6 @@ def student_socket_for(room, user_id):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_user_from_bearer():
-    """Extract and validate Bearer token, return user doc or None."""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
@@ -182,7 +178,6 @@ def _get_user_from_bearer():
     return users_col.find_one({"id": token})
 
 def _populate_session(user: dict):
-    """Write user fields into Flask session so route handlers work unchanged."""
     session["user_id"]   = user["id"]
     session["role"]      = user.get("role", "Student")
     session["user_name"] = user.get("fullname", "")
@@ -191,10 +186,8 @@ def _populate_session(user: dict):
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # 1. Flask session (same-origin / web)
         if "user_id" in session:
             return f(*args, **kwargs)
-        # 2. Authorization: Bearer <user_id> (mobile / cross-origin)
         user = _get_user_from_bearer()
         if user:
             _populate_session(user)
@@ -207,12 +200,10 @@ def role_required(required_role):
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
-            # 1. Flask session
             if "user_id" in session:
                 if session.get("role") != required_role:
                     return jsonify({"error": "Forbidden"}), 403
                 return f(*args, **kwargs)
-            # 2. Authorization: Bearer <user_id>
             user = _get_user_from_bearer()
             if user:
                 if user.get("role") != required_role:
@@ -231,18 +222,11 @@ def role_required(required_role):
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
-        origin = request.headers.get("Origin", "")
-        allowed = [
-            "http://localhost:8081",
-            "http://localhost:3000",
-            "https://your-production-frontend.com",
-        ]
         res = app.make_default_options_response()
-        if origin in allowed:
-            res.headers["Access-Control-Allow-Origin"] = origin   # ← echo back, not *
-            res.headers["Access-Control-Allow-Credentials"] = "true"
-        res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        res.headers["Access-Control-Allow-Origin"]      = request.headers.get("Origin", "*")
+        res.headers["Access-Control-Allow-Credentials"] = "true"
+        res.headers["Access-Control-Allow-Headers"]     = "Content-Type, Authorization"
+        res.headers["Access-Control-Allow-Methods"]     = "GET, POST, PUT, DELETE, OPTIONS"
         return res
 
 

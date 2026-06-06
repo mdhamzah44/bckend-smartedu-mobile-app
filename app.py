@@ -99,6 +99,7 @@ test_attempts_col  = db["test_attempts"]
 poll_sessions_col  = db["poll_sessions"]
 announcements_col  = db["announcements"]
 activity_log_col   = db["activity_log"]
+otp_store_col = db["otp_store"]
 
 ADMIN_ID = os.environ.get("ADMIN_ID", "83a39908-cb47-4589-8c58-46f388f3976d")
 
@@ -751,48 +752,70 @@ def login():
         if not check_password_hash(user["password"], password):
             return jsonify({"error": "Incorrect password"}), 401
 
-        otp = str(random.randint(100000, 999999))
-        session["login_otp"] = {
-            "user_id": user["id"], "fullname": user["fullname"],
-            "email": user["email"], "role": user["role"], "otp": otp,
-            "otp_expiry": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-        }
+        otp   = str(random.randint(100000, 999999))
+        token = str(uuid.uuid4())          # ← client holds this
+        expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        otp_store_col.update_one(
+            {"token": token},
+            {"$set": {
+                "token":    token,
+                "user_id":  user["id"],
+                "fullname": user["fullname"],
+                "email":    user["email"],
+                "role":     user["role"],
+                "otp":      otp,
+                "expiry":   expiry,
+                "type":     "login",
+            }},
+            upsert=True
+        )
         send_login_otp_email(user["email"], otp)
-        return jsonify({"requires_otp": True, "message": "OTP sent"})
+        return jsonify({"requires_otp": True, "message": "OTP sent", "otp_token": token})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+# /login-verify-otp — look up by token, not session
 @app.route("/login-verify-otp", methods=["POST"])
 def login_verify_otp():
     try:
-        data    = request.get_json() or request.form
-        entered = str(data.get("otp", "")).strip()
-        ld      = session.get("login_otp")
-        if not ld:
+        data      = request.get_json() or request.form
+        entered   = str(data.get("otp", "")).strip()
+        otp_token = str(data.get("otp_token", "")).strip()   # ← sent by client
+
+        if not otp_token:
+            return jsonify({"error": "Missing otp_token"}), 400
+
+        record = otp_store_col.find_one({"token": otp_token, "type": "login"})
+        if not record:
             return jsonify({"error": "No pending login"}), 400
-        expiry = datetime.fromisoformat(ld["otp_expiry"])
-        if datetime.now(timezone.utc) > expiry:
-            session.pop("login_otp", None)
+        if datetime.now(timezone.utc) > record["expiry"].replace(tzinfo=timezone.utc):
+            otp_store_col.delete_one({"token": otp_token})
             return jsonify({"error": "OTP expired"}), 400
-        if entered != ld["otp"]:
+        if entered != record["otp"]:
             return jsonify({"error": "Invalid OTP"}), 400
 
-        session.update({"user_id": ld["user_id"], "role": ld["role"], "user_name": ld["fullname"]})
-        session.permanent = True
-        session.pop("login_otp", None)
+        # Clean up
+        otp_store_col.delete_one({"token": otp_token})
 
-        user_out = {"id": ld["user_id"], "fullname": ld["fullname"],
-                    "email": ld["email"], "role": ld["role"]}
-        return jsonify({"user": user_out, "token": ld["user_id"]})
+        # Set server session (best-effort; mobile uses the returned token)
+        session.update({
+            "user_id":   record["user_id"],
+            "role":      record["role"],
+            "user_name": record["fullname"],
+        })
+        session.permanent = True
+
+        user_out = {
+            "id":       record["user_id"],
+            "fullname": record["fullname"],
+            "email":    record["email"],
+            "role":     record["role"],
+        }
+        return jsonify({"user": user_out, "token": record["user_id"]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-@app.route("/logout", methods=["POST", "GET"])
-def logout():
-    session.clear()
-    return jsonify({"message": "Logged out"})
 
 
 # ── Student home data ─────────────────────────────────────────────────────────

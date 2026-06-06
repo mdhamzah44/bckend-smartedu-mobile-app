@@ -170,20 +170,49 @@ def student_socket_for(room, user_id):
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if "user_id" not in session:
-            return jsonify({"error": "Unauthorized"}), 401
-        return f(*args, **kwargs)
+        # 1. Try Flask session (same-origin / web)
+        if "user_id" in session:
+            return f(*args, **kwargs)
+
+        # 2. Try Authorization: Bearer <token> (mobile / cross-origin)
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+            user = users_col.find_one({"id": token})
+            if user:
+                # Populate session-like keys so route handlers work unchanged
+                session["user_id"] = user["id"]
+                session["role"]    = user.get("role", "Student")
+                session["user_name"] = user.get("fullname", "")
+                return f(*args, **kwargs)
+
+        return jsonify({"error": "Unauthorized"}), 401
     return decorated
 
 def role_required(required_role):
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
-            if "user_id" not in session:
-                return jsonify({"error": "Unauthorized"}), 401
-            if session.get("role") != required_role:
-                return jsonify({"error": "Forbidden"}), 403
-            return f(*args, **kwargs)
+            # 1. Try Flask session
+            if "user_id" in session:
+                if session.get("role") != required_role:
+                    return jsonify({"error": "Forbidden"}), 403
+                return f(*args, **kwargs)
+
+            # 2. Try Authorization: Bearer <token>
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header.split(" ", 1)[1].strip()
+                user = users_col.find_one({"id": token})
+                if user:
+                    if user.get("role") != required_role:
+                        return jsonify({"error": "Forbidden"}), 403
+                    session["user_id"]   = user["id"]
+                    session["role"]      = user.get("role", "Student")
+                    session["user_name"] = user.get("fullname", "")
+                    return f(*args, **kwargs)
+
+        return jsonify({"error": "Unauthorized"}), 401
         return decorated
     return decorator
 

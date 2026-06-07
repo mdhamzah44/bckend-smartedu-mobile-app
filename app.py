@@ -858,41 +858,129 @@ def logout():
 def student_home():
     user_id = session["user_id"]
     today   = datetime.now().strftime("%Y-%m-%d")
-    enrolled_class_ids  = {e["class_id"]  for e in user_classes_col.find({"user_id": user_id})}
-    enrolled_course_ids = {e["course_id"] for e in user_courses_col.find({"user_id": user_id})}
-
-    all_classes      = list(classes_col.find({"class_id": {"$in": list(enrolled_class_ids)}}))
-    today_classes    = [c for c in all_classes if c.get("date") == today]
-    upcoming_classes = [c for c in all_classes if c.get("date", "") > today]
-
-    def fmt_class(c):
-        teacher = users_col.find_one({"id": c.get("teacher_id")})
-        return {
-            "class_id":     c["class_id"],
-            "title":        c.get("subject", c.get("title", "")),
-            "date":         c.get("date"),
-            "time":         c.get("time"),
-            "status":       get_class_status(c),
-            "teacher_name": teacher.get("fullname") if teacher else "",
-            "is_free":      c.get("is_free", False),
-        }
-
-    courses = []
+ 
+    # ── 1. User ───────────────────────────────────────────────────────────────
+    user_doc = users_col.find_one({"id": user_id}, {"_id": 0, "password": 0})
+    if not user_doc:
+        return jsonify({"error": "User not found"}), 404
+ 
+    # Normalise subscription expiry
+    expiry = user_doc.get("subscription_expiry") or user_doc.get("subcription_till")
+    user_out = {
+        "id":              user_doc["id"],
+        "fullname":        user_doc.get("fullname", ""),
+        "email":           user_doc.get("email", ""),
+        "phone":           user_doc.get("phone", ""),
+        "subscribed":      user_doc.get("subscribed", "no"),
+        "subcription_till": expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry) if expiry else None,
+    }
+ 
+    # ── 2. Enrolled courses ───────────────────────────────────────────────────
+    enrolled_course_ids = [
+        e["course_id"] for e in user_courses_col.find({"user_id": user_id})
+    ]
+    enrolled_course_ids_set = set(enrolled_course_ids)
+ 
+    enrolled_courses = []
     for cid in enrolled_course_ids:
-        course = courses_col.find_one({"course_id": cid})
-        if course:
-            teacher = teachers_col.find_one({"teacher_id": course.get("teacher_id")})
-            courses.append({
-                "course_id":     cid,
-                "title":         course.get("name"),
-                "teacher_name":  teacher.get("fullname") if teacher else "",
-                "total_classes": course.get("total_classes", 0),
+        c = courses_col.find_one({"course_id": cid})
+        if c:
+            enrolled_courses.append({
+                "course_id": cid,
+                "name":      c.get("name", ""),
+                "desc":      c.get("desc", ""),
             })
-
+ 
+    # ── 3. All courses (for Browse tab) ──────────────────────────────────────
+    all_courses_raw = list(courses_col.find({}, {"_id": 0}))
+    all_courses = []
+    for c in all_courses_raw:
+        for k, v in c.items():
+            if hasattr(v, "isoformat"):
+                c[k] = v.isoformat()
+        all_courses.append({
+            "course_id": c.get("course_id", ""),
+            "name":      c.get("name", ""),
+            "desc":      c.get("desc", ""),
+        })
+ 
+    # ── 4. Tests for enrolled courses ────────────────────────────────────────
+    tests_raw = list(tests_col.find({"course_id": {"$in": enrolled_course_ids}}))
+    tests_out = []
+    for t in tests_raw:
+        st = t.get("start_time")
+        tests_out.append({
+            "test_id":  t["test_id"],
+            "title":    t.get("name", ""),
+            "subject":  t.get("name", ""),
+            "duration": t.get("duration", 60),
+            "start_time": st.isoformat() if hasattr(st, "isoformat") else str(st) if st else None,
+        })
+ 
+    # ── 5. Today's classes ────────────────────────────────────────────────────
+    enrolled_class_ids = {
+        e["class_id"] for e in user_classes_col.find({"user_id": user_id})
+    }
+    today_classes_raw = list(
+        classes_col.find({"class_id": {"$in": list(enrolled_class_ids)}, "date": today})
+    )
+ 
+    def fmt_time(time_str: str) -> str:
+        """Convert 'HH:MM' → '12:30 PM' style."""
+        try:
+            t = datetime.strptime(time_str, "%H:%M")
+            return t.strftime("%I:%M %p").lstrip("0")
+        except Exception:
+            return time_str or ""
+ 
+    today_classes_out = []
+    for c in today_classes_raw:
+        teacher = users_col.find_one({"id": c.get("teacher_id")}, {"fullname": 1})
+        raw_time = c.get("time", "")
+        today_classes_out.append({
+            "class_id":      c["class_id"],
+            "subject":       c.get("subject", c.get("title", "")),
+            "date":          c.get("date", today),
+            "time":          raw_time,
+            "formatted_time": fmt_time(raw_time),
+            "teacher_name":  teacher.get("fullname", "") if teacher else "",
+            "status":        get_class_status(c),
+            "link":          c.get("link"),
+            "is_free":       c.get("is_free", False),
+            "type":          "class",
+            "duration":      c.get("duration", 60),
+        })
+ 
+    # Also add today's tests as class-like items (Planner shows them together)
+    for t in tests_raw:
+        st = t.get("start_time")
+        if st and hasattr(st, "strftime") and st.strftime("%Y-%m-%d") == today:
+            raw_time = st.strftime("%H:%M")
+            today_classes_out.append({
+                "class_id":       t["test_id"],   # reuse field so frontend key works
+                "test_id":        t["test_id"],
+                "subject":        t.get("name", "Test"),
+                "date":           today,
+                "time":           raw_time,
+                "formatted_time": fmt_time(raw_time),
+                "teacher_name":   "",
+                "status":         "upcoming",
+                "link":           None,
+                "is_free":        False,
+                "type":           "test",
+                "duration":       t.get("duration", 60),
+            })
+ 
+    # Sort by time
+    today_classes_out.sort(key=lambda x: x.get("time", ""))
+ 
     return jsonify({
-        "today_classes":    [fmt_class(c) for c in today_classes],
-        "upcoming_classes": [fmt_class(c) for c in upcoming_classes[:10]],
-        "courses":          courses,
+        "user":             user_out,
+        "courses":          enrolled_courses,
+        "all_courses":      all_courses,
+        "tests":            tests_out,
+        "today_classes":    today_classes_out,
+        "user_courses_ids": list(enrolled_course_ids_set),
     })
 
 
